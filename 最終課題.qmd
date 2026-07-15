@@ -1,0 +1,198 @@
+---
+title: "欧州サッカーリーグ 成績ダッシュボード"
+author: "by 栗原将太"
+institute: "東京国際大学 データサイエンス教育研究所"
+date: today
+format: dashboard
+server: shiny
+---
+
+```{r}
+#| context: setup
+library(shiny)
+library(httr)
+library(jsonlite)
+library(plotly)
+library(DT)
+library(dplyr)
+
+# ------------------------------------------------------------------
+# football-data.org の無料APIキーを設定してください
+# 取得方法: https://www.football-data.org/client/register で無料登録
+# （無料プランは 10リクエスト/分 の制限あり）
+# 環境変数 FOOTBALL_DATA_API_KEY にセットしておくと安全です
+# ------------------------------------------------------------------
+API_KEY <- "f8a052b35d55474a99224dcc511a4ba7"
+
+# 無料プランで利用可能な主要リーグ（コンペティションコード）
+leagues <- list(
+  "プレミアリーグ（イングランド）" = "PL",
+  "ブンデスリーガ（ドイツ）"       = "BL1",
+  "セリエA（イタリア）"            = "SA",
+  "ラ・リーガ（スペイン）"         = "PD",
+  "リーグ・アン（フランス）"       = "FL1"
+)
+
+api_get <- function(path) {
+  url <- paste0("https://api.football-data.org/v4/", path)
+  res <- GET(url, add_headers("X-Auth-Token" = API_KEY))
+  if (status_code(res) != 200) {
+    stop(sprintf("APIエラー (status %s): %s", status_code(res),
+                  content(res, "text", encoding = "UTF-8")))
+  }
+  fromJSON(content(res, "text", encoding = "UTF-8"))
+}
+
+# 選択可能なシーズン（開始年で指定。例: 2023 = 2023-24シーズン）
+# 無料プランでは対応していないシーズンがある場合、APIエラーで通知されます
+this_year <- as.integer(format(Sys.Date(), "%Y"))
+season_years <- seq(this_year, this_year - 5)
+season_choices <- setNames(season_years,
+                            sprintf("%d-%sシーズン", season_years, substr(season_years + 1, 3, 4)))
+# 順位表を取得（クラブID付き）
+get_standings <- function(comp_code, season) {
+  d   <- api_get(sprintf("competitions/%s/standings?season=%d", comp_code, season))
+  tbl <- d$standings$table[[1]]
+  data.frame(
+    順位   = tbl$position,
+    クラブ = tbl$team$name,
+    ID     = tbl$team$id,
+    試合数 = tbl$playedGames,
+    勝点   = tbl$points,
+    得失差 = tbl$goalDifference,
+    stringsAsFactors = FALSE
+  )
+}
+
+# 指定クラブの終了済み試合を取得し、節ごとの勝点推移も付与
+get_team_matches <- function(team_id, season) {
+  d <- api_get(sprintf("teams/%s/matches?season=%d&status=FINISHED", team_id, season))
+  m <- d$matches
+
+  home_id <- m$homeTeam$id
+  is_home <- home_id == team_id
+  gf <- ifelse(is_home, m$score$fullTime$home, m$score$fullTime$away)
+  ga <- ifelse(is_home, m$score$fullTime$away, m$score$fullTime$home)
+
+  result <- case_when(
+    gf > ga ~ "勝",
+    gf == ga ~ "分",
+    TRUE ~ "負"
+  )
+  pt <- case_when(result == "勝" ~ 3, result == "分" ~ 1, TRUE ~ 0)
+
+  data.frame(
+    節        = seq_len(nrow(m)),
+    日付      = as.Date(m$utcDate),
+    対戦カード = paste(m$homeTeam$name, "vs", m$awayTeam$name),
+    スコア    = paste(m$score$fullTime$home, "-", m$score$fullTime$away),
+    結果      = result,
+    勝点      = pt,
+    stringsAsFactors = FALSE
+  ) |>
+    arrange(日付) |>
+    mutate(累積勝点 = cumsum(勝点))
+}
+```
+
+## {.sidebar}
+
+```{r}
+selectInput("league", "リーグを選択：", choices = names(leagues),
+            selected = "プレミアリーグ（イングランド）")
+uiOutput("club_ui")
+selectInput("season", "シーズンを選択：", choices = season_choices,
+            selected = season_choices[2])  # デフォルトは前シーズン
+```
+
+データ提供：football-data.org（無料プラン）
+
+## Row {height="22%"}
+
+```{r}
+#| content: valuebox
+#| title: "現在の順位"
+#| icon: trophy
+#| color: primary
+textOutput("cur_rank")
+```
+
+```{r}
+#| content: valuebox
+#| title: "現在の勝点"
+#| icon: star
+#| color: success
+textOutput("cur_points")
+```
+
+```{r}
+#| content: valuebox
+#| title: "得失点差"
+#| icon: graph-up-arrow
+#| color: info
+textOutput("cur_gd")
+```
+
+## Row {height="78%"}
+
+### Column {width="60%"}
+
+```{r}
+#| title: "勝点の推移（節ごと・累積）"
+plotlyOutput("pointsplot")
+```
+
+### Column {width="40%"}
+
+```{r}
+#| title: "試合結果一覧"
+DTOutput("tbl")
+```
+
+```{r}
+#| context: server
+
+standings_data <- reactive({
+  req(input$league, input$season)
+  get_standings(leagues[[input$league]], as.integer(input$season))
+})
+
+output$club_ui <- renderUI({
+  st <- standings_data()
+  selectInput("club", "クラブを選択：",
+              choices = setNames(st$ID, st$クラブ),
+              selected = st$ID[1])
+})
+
+current_row <- reactive({
+  req(input$club)
+  standings_data() |> filter(ID == as.integer(input$club))
+})
+
+matches_data <- reactive({
+  req(input$club, input$season)
+  get_team_matches(as.integer(input$club), as.integer(input$season))
+})
+
+output$cur_rank   <- renderText(sprintf("%d 位", current_row()$順位))
+output$cur_points <- renderText(sprintf("%d pt", current_row()$勝点))
+output$cur_gd     <- renderText(sprintf("%+d", current_row()$得失差))
+
+output$pointsplot <- renderPlotly({
+  df <- matches_data()
+  plot_ly(df, x = ~節, y = ~累積勝点,
+          type = "scatter", mode = "lines+markers",
+          line = list(color = "#2c7fb8"),
+          marker = list(color = "#2c7fb8", size = 6),
+          text = ~paste0(対戦カード, "（", スコア, "）"),
+          hoverinfo = "text+y") |>
+    layout(xaxis = list(title = "節"),
+           yaxis = list(title = "累積勝点"))
+})
+
+output$tbl <- renderDT({
+  df <- matches_data() |> select(節, 日付, 対戦カード, スコア, 結果)
+  datatable(df, rownames = FALSE,
+            options = list(pageLength = 10, dom = "tip"))
+})
+```
